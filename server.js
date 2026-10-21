@@ -1,7 +1,8 @@
 // Front door for the Railway service.
-// - WebSocket upgrade on /tk-rail -> VMess inbound (127.0.0.1:10000, for Surge)
+// - WebSocket upgrade on /tk-rail -> VMess inbound (127.0.0.1:10000, for Surge/Clash)
 // - WebSocket upgrade on /tk-vless -> VLESS inbound (127.0.0.1:10001, other clients)
-// - GET /sub-<SUB_TOKEN> -> Surge managed config, filled with the real public host
+// - GET /sub-<SUB_TOKEN> -> Auto-detects client (Clash YAML or Surge Managed Config)
+// - GET /clash-<SUB_TOKEN> -> Clash YAML profile
 // - everything else -> 400, so from outside it just looks like a broken website
 const http = require('http');
 const net = require('net');
@@ -10,8 +11,6 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const UUID = process.env.UUID || '';
 const SUB_TOKEN = process.env.SUB_TOKEN || '';
 
-// Surge does not support VLESS, so the Surge-facing path /tk-rail is VMess.
-// VLESS stays available for other clients on /tk-vless.
 const WS_ROUTES = {
   '/tk-rail': 10000,
   '/tk-vless': 10001
@@ -40,10 +39,54 @@ FINAL,PROXY
 `;
 }
 
+function clashConfig(hostHeader) {
+  const host = (hostHeader || '').split(':')[0];
+  return `port: 7890
+socks-port: 7891
+allow-lan: false
+mode: rule
+log-level: info
+proxies:
+  - name: "Railway-US"
+    type: vmess
+    server: ${host}
+    port: 443
+    uuid: ${UUID}
+    alterId: 0
+    cipher: auto
+    tls: true
+    skip-cert-verify: false
+    network: ws
+    ws-opts:
+      path: ${WS_PATH}
+      headers:
+        Host: ${host}
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - "Railway-US"
+      - DIRECT
+
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
+`;
+}
+
 const server = http.createServer((req, res) => {
   const host = req.headers.host || '';
+  const ua = (req.headers['user-agent'] || '').toLowerCase();
+  const isClash = ua.includes('clash') || req.url.startsWith(`/clash-`);
 
-  if (SUB_TOKEN && req.url === `/sub-${SUB_TOKEN}`) {
+  if (SUB_TOKEN && (req.url === `/sub-${SUB_TOKEN}` || req.url === `/clash-${SUB_TOKEN}`)) {
+    if (isClash) {
+      const body = clashConfig(host);
+      res.writeHead(200, { 'content-type': 'text/yaml; charset=utf-8' });
+      res.end(body);
+      return;
+    }
     const body = surgeConfig(host);
     res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
     res.end(body);
@@ -73,7 +116,6 @@ server.on('upgrade', (req, socket, head) => {
   }
 
   const upstream = net.connect(xrayPort, '127.0.0.1', () => {
-    // Replay the original upgrade request verbatim to xray.
     let raw = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       raw += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
